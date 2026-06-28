@@ -1,0 +1,5 @@
+.build/
+Vox.app/
+.DS_Store
+*.xcuserstate
+.swiftpm/
