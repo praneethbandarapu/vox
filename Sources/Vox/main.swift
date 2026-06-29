@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rightOptionDown = false
     private var active = false
     private let capture = AudioCapture()
+    private var stream: DeepgramStream?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logf("applicationDidFinishLaunching")
@@ -180,9 +181,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rightOptionPressed() {
+        guard Keychain.get(account: deepgramAccount) != nil else {
+            logf("dictation: no Deepgram key set")
+            NSSound.beep()
+            return
+        }
         active = true
         renderIcon()
         logf("RIGHT OPTION DOWN (start dictation)")
+
+        let dg = DeepgramStream()
+        dg.start()
+        stream = dg
+        capture.onChunk = { [weak dg] data in dg?.send(data) }
         capture.start()
     }
 
@@ -190,10 +201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         active = false
         renderIcon()
         logf("RIGHT OPTION UP (end dictation)")
-        let pcm = capture.stop()
+        _ = capture.stop()
+        capture.onChunk = nil
+        let dg = stream
+        stream = nil
         Task {
-            let text = await Deepgram.transcribe(pcm)
-            guard let text, !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            let text = (await dg?.finish() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
                 logf("dictation: empty transcript")
                 return
             }

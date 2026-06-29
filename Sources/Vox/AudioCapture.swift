@@ -10,6 +10,9 @@ final class AudioCapture {
     private var pcm = Data()
     private let lock = NSLock()
 
+    // Called with each converted PCM16 chunk as it is captured (for streaming).
+    var onChunk: ((Data) -> Void)?
+
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: 16_000,
@@ -65,5 +68,6 @@ final class AudioCapture {
         guard out.frameLength > 0, let channel = out.int16ChannelData else { return }
         let bytes = Data(bytes: channel[0], count: Int(out.frameLength) * MemoryLayout<Int16>.size)
         lock.lock(); pcm.append(bytes); lock.unlock()
+        onChunk?(bytes)
     }
 }
