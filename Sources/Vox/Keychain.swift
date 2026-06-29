@@ -25,6 +25,20 @@ enum Keychain {
         return status == errSecSuccess
     }
 
+    // Checks whether a secret exists WITHOUT decrypting it. Reading only the
+    // attributes (not the data) does not trigger a Keychain access prompt, so
+    // this is safe to call at startup / when building the menu.
+    static func exists(account: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: false,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+    }
+
     static func get(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

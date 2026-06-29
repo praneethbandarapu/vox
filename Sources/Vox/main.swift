@@ -4,12 +4,14 @@ import AVFoundation
 import Carbon.HIToolbox
 
 // Vox - menu-bar voice assistant.
-// Trigger: hold Right Option (push-to-talk). Detecting a lone modifier
-// globally needs Accessibility permission, requested on launch.
-// Secrets (e.g. Deepgram key) live only in the macOS Keychain.
+// Trigger: hold Right Option (push-to-talk). Audio streams to Deepgram for
+// transcription; optionally cleaned by Claude; then typed into the focused app.
+// Secrets (Deepgram, Anthropic keys) live only in the macOS Keychain.
 
 let logPath = "/tmp/vox.log"
 let deepgramAccount = "deepgram-api-key"
+let anthropicAccount = "anthropic-api-key"
+let groqAccount = "groq-api-key"
 
 func logf(_ message: String) {
     let line = "[\(Date())] \(message)\n"
@@ -35,7 +37,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rightOptionDown = false
     private var active = false
     private let capture = AudioCapture()
-    private var stream: DeepgramStream?
+    private var transcriber: Transcriber?
+
+    private var cleanupEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "cleanupEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "cleanupEnabled") }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logf("applicationDidFinishLaunching")
@@ -44,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestAccessibility()
         requestMicrophone()
         startKeyMonitor()
-        logf("launch complete. deepgramKeySet=\(Keychain.get(account: deepgramAccount) != nil)")
+        logf("launch complete. deepgramKeySet=\(Keychain.exists(account: deepgramAccount))")
     }
 
     private func requestMicrophone() {
@@ -84,28 +91,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Vox v0.0.2", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Vox v0.0.3", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Trigger: hold Right Option", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
 
-        let hasKey = Keychain.get(account: deepgramAccount) != nil
-        menu.addItem(NSMenuItem(title: hasKey ? "Deepgram key: set" : "Deepgram key: not set",
+        // Deepgram (speech-to-text)
+        let hasDeepgram = Keychain.exists(account: deepgramAccount)
+        menu.addItem(NSMenuItem(title: hasDeepgram ? "Deepgram key: set" : "Deepgram key: not set",
                                 action: nil, keyEquivalent: ""))
-        let setKey = NSMenuItem(title: "Set Deepgram API Key…", action: #selector(showSetKey), keyEquivalent: "")
-        setKey.target = self
-        menu.addItem(setKey)
-        if hasKey {
-            let clear = NSMenuItem(title: "Clear Deepgram Key", action: #selector(clearKey), keyEquivalent: "")
-            clear.target = self
-            menu.addItem(clear)
+        addItem(to: menu, title: "Set Deepgram API Key…", action: #selector(showSetDeepgramKey))
+        if hasDeepgram {
+            addItem(to: menu, title: "Clear Deepgram Key", action: #selector(clearDeepgramKey))
         }
 
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Vox", action: #selector(quit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
+
+        // Cleanup (LLM) - provider-driven, swappable
+        let cleaner = ProviderFactory.makeCleaner()
+        menu.addItem(NSMenuItem(title: "\(cleaner.displayName) key: \(cleaner.isConfigured ? "set" : "not set")",
+                                action: nil, keyEquivalent: ""))
+        addItem(to: menu, title: "Set \(cleaner.displayName) API Key…", action: #selector(showSetCleanerKey))
+        if cleaner.isConfigured {
+            addItem(to: menu, title: "Clear \(cleaner.displayName) Key", action: #selector(clearCleanerKey))
+        }
+        let cleanup = addItem(to: menu, title: "Clean up with \(cleaner.displayName)", action: #selector(toggleCleanup))
+        cleanup.state = cleanupEnabled ? .on : .off
+
+        menu.addItem(.separator())
+        addItem(to: menu, title: "Quit Vox", action: #selector(quit), key: "q")
 
         statusItem.menu = menu
+    }
+
+    @discardableResult
+    private func addItem(to menu: NSMenu, title: String, action: Selector, key: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        menu.addItem(item)
+        return item
     }
 
     private func renderIcon() {
@@ -117,38 +140,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    // MARK: Deepgram key entry (stored in Keychain)
+    // MARK: API key entry (stored in Keychain)
 
-    @objc private func showSetKey() {
+    @objc private func showSetDeepgramKey() { promptForKey(label: "Deepgram", account: deepgramAccount) }
+    @objc private func clearDeepgramKey() { Keychain.delete(account: deepgramAccount); refreshMenu() }
+
+    @objc private func showSetCleanerKey() {
+        let c = ProviderFactory.makeCleaner()
+        promptForKey(label: c.displayName, account: c.keyAccount)
+    }
+    @objc private func clearCleanerKey() {
+        let c = ProviderFactory.makeCleaner()
+        Keychain.delete(account: c.keyAccount)
+        refreshMenu()
+    }
+
+    @objc private func toggleCleanup() {
+        cleanupEnabled.toggle()
+        logf("cleanup enabled=\(cleanupEnabled)")
+        refreshMenu()
+    }
+
+    private func promptForKey(label: String, account: String) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Set Deepgram API Key"
-        alert.informativeText = "Paste your Deepgram API key. It is stored only in your macOS Keychain, never in the app, the repo, or any file."
+        alert.messageText = "Set \(label) API Key"
+        alert.informativeText = "Paste your \(label) API key. It is stored only in your macOS Keychain, never in the app, the repo, or any file."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
 
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "Deepgram API key"
+        field.placeholderString = "\(label) API key"
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
 
         if alert.runModal() == .alertFirstButtonReturn {
             let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !key.isEmpty else {
-                logf("set key: empty, ignored")
-                return
-            }
-            let ok = Keychain.set(key, account: deepgramAccount)
-            // Never log the key itself, only that it saved and its length.
-            logf("Deepgram key saved=\(ok) length=\(key.count)")
+            guard !key.isEmpty else { logf("set \(label) key: empty, ignored"); return }
+            let ok = Keychain.set(key, account: account)
+            logf("\(label) key saved=\(ok) length=\(key.count)")
             refreshMenu()
         }
-    }
-
-    @objc private func clearKey() {
-        Keychain.delete(account: deepgramAccount)
-        logf("Deepgram key cleared")
-        refreshMenu()
     }
 
     // MARK: Permissions
@@ -181,8 +213,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rightOptionPressed() {
-        guard Keychain.get(account: deepgramAccount) != nil else {
-            logf("dictation: no Deepgram key set")
+        let t = ProviderFactory.makeTranscriber()
+        guard t.isConfigured else {
+            logf("dictation: STT provider not configured")
             NSSound.beep()
             return
         }
@@ -190,10 +223,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renderIcon()
         logf("RIGHT OPTION DOWN (start dictation)")
 
-        let dg = DeepgramStream()
-        dg.start()
-        stream = dg
-        capture.onChunk = { [weak dg] data in dg?.send(data) }
+        t.start()
+        transcriber = t
+        capture.onChunk = { [weak t] data in t?.send(data) }
         capture.start()
     }
 
@@ -203,15 +235,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logf("RIGHT OPTION UP (end dictation)")
         _ = capture.stop()
         capture.onChunk = nil
-        let dg = stream
-        stream = nil
+        let t = transcriber
+        transcriber = nil
+
+        let cleaner = ProviderFactory.makeCleaner()
+        let shouldClean = cleanupEnabled && cleaner.isConfigured
+
         Task {
-            let text = (await dg?.finish() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else {
-                logf("dictation: empty transcript")
-                return
+            var text = (await t?.finish() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { logf("dictation: empty transcript"); return }
+            if shouldClean,
+               let cleaned = await cleaner.clean(text)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !cleaned.isEmpty {
+                text = cleaned
             }
-            await MainActor.run { TextInjector.insert(text) }
+            let finalText = text
+            await MainActor.run { TextInjector.insert(finalText) }
         }
     }
 }

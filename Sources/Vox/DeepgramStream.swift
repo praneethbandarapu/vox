@@ -4,13 +4,15 @@ import Foundation
 // real time while the user holds the key, so on release the transcript is
 // already (almost) ready. Much lower perceived latency than batch upload.
 
-final class DeepgramStream {
+final class DeepgramStream: Transcriber {
     private let session = URLSession(configuration: .default)
     private var task: URLSessionWebSocketTask?
     private var finals: [String] = []
     private let lock = NSLock()
     private var continuation: CheckedContinuation<String, Never>?
     private var finished = false
+
+    var isConfigured: Bool { Keychain.exists(account: deepgramAccount) }
 
     func start() {
         guard let key = Keychain.get(account: deepgramAccount), !key.isEmpty else {
@@ -36,8 +38,8 @@ final class DeepgramStream {
         logf("DeepgramStream opened")
     }
 
-    func send(_ pcm: Data) {
-        task?.send(.data(pcm)) { error in
+    func send(_ pcm16: Data) {
+        task?.send(.data(pcm16)) { error in
             if let error { logf("DeepgramStream send error: \(error.localizedDescription)") }
         }
     }
