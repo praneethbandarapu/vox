@@ -2,6 +2,8 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import Carbon.HIToolbox
+import ServiceManagement
+import SwiftUI
 
 // Vox - menu-bar voice assistant.
 // Trigger: hold Right Option (push-to-talk). Audio streams to Deepgram for
@@ -38,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var active = false
     private let capture = AudioCapture()
     private var transcriber: Transcriber?
+    private let indicator = RecordingIndicator()
+    private var historyWindow: NSWindow?
+    private var pasteHotKeyRef: EventHotKeyRef?
+    private var pasteHandlerRef: EventHandlerRef?
 
     private var cleanupEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: "cleanupEnabled") }
@@ -51,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestAccessibility()
         requestMicrophone()
         startKeyMonitor()
+        registerPasteHotKey()
         logf("launch complete. deepgramKeySet=\(Keychain.exists(account: deepgramAccount))")
     }
 
@@ -118,6 +125,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanup.state = cleanupEnabled ? .on : .off
 
         menu.addItem(.separator())
+        addItem(to: menu, title: "Dictation History…", action: #selector(showHistory))
+        let login = addItem(to: menu, title: "Launch at Login", action: #selector(toggleLoginItem))
+        login.state = loginEnabled ? .on : .off
+
+        menu.addItem(.separator())
         addItem(to: menu, title: "Quit Vox", action: #selector(quit), key: "q")
 
         statusItem.menu = menu
@@ -159,6 +171,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanupEnabled.toggle()
         logf("cleanup enabled=\(cleanupEnabled)")
         refreshMenu()
+    }
+
+    // MARK: History window
+
+    @objc private func showHistory() {
+        let hosting = NSHostingController(rootView: HistoryView())
+        if let window = historyWindow {
+            window.contentViewController = hosting
+        } else {
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Vox - Dictation History"
+            window.styleMask = [.titled, .closable, .miniaturizable]
+            window.isReleasedWhenClosed = false
+            historyWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        historyWindow?.center()
+        historyWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: Launch at login
+
+    private var loginEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    @objc private func toggleLoginItem() {
+        do {
+            if loginEnabled { try SMAppService.mainApp.unregister() }
+            else { try SMAppService.mainApp.register() }
+            logf("login item enabled=\(loginEnabled)")
+        } catch {
+            logf("login item error: \(error.localizedDescription)")
+        }
+        refreshMenu()
+    }
+
+    // MARK: Paste-last hotkey (Cmd+Shift+V)
+
+    private func registerPasteHotKey() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                      eventKind: UInt32(kEventHotKeyPressed))
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(GetApplicationEventTarget(), { (_, _, userData) -> OSStatus in
+            guard let userData else { return OSStatus(eventNotHandledErr) }
+            let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            me.pasteHotKeyFired()
+            return noErr
+        }, 1, &eventType, selfPtr, &pasteHandlerRef)
+
+        let id = EventHotKeyID(signature: OSType(0x564F_5832), id: 2) // 'VOX2'
+        RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(cmdKey | shiftKey), id,
+                            GetApplicationEventTarget(), 0, &pasteHotKeyRef)
+        logf("paste hotkey (Cmd+Shift+V) registered")
+    }
+
+    private func pasteHotKeyFired() {
+        logf("Cmd+Shift+V: paste last dictation")
+        // Brief delay so the user's Shift is released before we synthesize Cmd+V.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            TextInjector.pasteLast()
+        }
+    }
+
+    private func playSound(_ name: String) {
+        NSSound(named: name)?.play()
     }
 
     private func promptForKey(label: String, account: String) {
@@ -221,6 +297,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         active = true
         renderIcon()
+        indicator.show()
+        playSound("Tink")
         logf("RIGHT OPTION DOWN (start dictation)")
 
         t.start()
@@ -232,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rightOptionReleased() {
         active = false
         renderIcon()
+        indicator.hide()
         logf("RIGHT OPTION UP (end dictation)")
         _ = capture.stop()
         capture.onChunk = nil
@@ -250,7 +329,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 text = cleaned
             }
             let finalText = text
-            await MainActor.run { TextInjector.insert(finalText) }
+            await MainActor.run {
+                HistoryStore.add(finalText)               // never lose it
+                let delivered = TextInjector.deliver(finalText)
+                self.playSound(delivered ? "Pop" : "Funk") // Funk = buffered, use Cmd+Shift+V
+            }
         }
     }
 }
