@@ -1,14 +1,15 @@
 import AppKit
 import ApplicationServices
+import AVFoundation
 import Carbon.HIToolbox
 
-// Vox - M0 scaffold.
-// A menu-bar (accessory) app. Trigger key: hold Right Option (push-to-talk style).
-// Detecting a lone modifier globally needs Accessibility permission, which we
-// request on launch. For M0 the key just beeps + toggles the menu-bar glyph,
-// proving the "invoke from anywhere" plumbing before the mic arrives in M1.
+// Vox - menu-bar voice assistant.
+// Trigger: hold Right Option (push-to-talk). Detecting a lone modifier
+// globally needs Accessibility permission, requested on launch.
+// Secrets (e.g. Deepgram key) live only in the macOS Keychain.
 
 let logPath = "/tmp/vox.log"
+let deepgramAccount = "deepgram-api-key"
 
 func logf(_ message: String) {
     let line = "[\(Date())] \(message)\n"
@@ -33,13 +34,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var localMonitor: Any?
     private var rightOptionDown = false
     private var active = false
+    private let capture = AudioCapture()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logf("applicationDidFinishLaunching")
+        setUpMainMenu()
         setUpMenuBar()
         requestAccessibility()
+        requestMicrophone()
         startKeyMonitor()
-        logf("launch complete. statusItem.button present=\(statusItem.button != nil)")
+        logf("launch complete. deepgramKeySet=\(Keychain.get(account: deepgramAccount) != nil)")
+    }
+
+    private func requestMicrophone() {
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            logf("microphone access granted=\(granted)")
+        }
+    }
+
+    // MARK: Main menu (enables Cmd+C/V/X/A in text fields)
+
+    private func setUpMainMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        NSApp.mainMenu = mainMenu
     }
 
     // MARK: Menu bar
@@ -47,16 +77,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setUpMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         renderIcon()
+        refreshMenu()
+        logf("menu bar set up")
+    }
 
+    private func refreshMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Vox v0.0.1 (M0 scaffold)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Vox v0.0.2", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Trigger: hold Right Option", action: nil, keyEquivalent: ""))
+        menu.addItem(.separator())
+
+        let hasKey = Keychain.get(account: deepgramAccount) != nil
+        menu.addItem(NSMenuItem(title: hasKey ? "Deepgram key: set" : "Deepgram key: not set",
+                                action: nil, keyEquivalent: ""))
+        let setKey = NSMenuItem(title: "Set Deepgram API Key…", action: #selector(showSetKey), keyEquivalent: "")
+        setKey.target = self
+        menu.addItem(setKey)
+        if hasKey {
+            let clear = NSMenuItem(title: "Clear Deepgram Key", action: #selector(clearKey), keyEquivalent: "")
+            clear.target = self
+            menu.addItem(clear)
+        }
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Vox", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+
         statusItem.menu = menu
-        logf("menu bar set up")
     }
 
     private func renderIcon() {
@@ -66,6 +114,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: Deepgram key entry (stored in Keychain)
+
+    @objc private func showSetKey() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Set Deepgram API Key"
+        alert.informativeText = "Paste your Deepgram API key. It is stored only in your macOS Keychain, never in the app, the repo, or any file."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "Deepgram API key"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else {
+                logf("set key: empty, ignored")
+                return
+            }
+            let ok = Keychain.set(key, account: deepgramAccount)
+            // Never log the key itself, only that it saved and its length.
+            logf("Deepgram key saved=\(ok) length=\(key.count)")
+            refreshMenu()
+        }
+    }
+
+    @objc private func clearKey() {
+        Keychain.delete(account: deepgramAccount)
+        logf("Deepgram key cleared")
+        refreshMenu()
     }
 
     // MARK: Permissions
@@ -80,11 +162,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Global key monitor (Right Option)
 
     private func startKeyMonitor() {
-        // Global monitor fires when other apps are focused (needs Accessibility).
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.handleFlagsChanged(event)
         }
-        // Local monitor fires when Vox itself is focused; must return the event.
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.handleFlagsChanged(event)
             return event
@@ -94,26 +174,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleFlagsChanged(_ event: NSEvent) {
         let isDown = (event.modifierFlags.rawValue & kRightOptionBit) != 0
-        guard isDown != rightOptionDown else { return } // only on transitions
+        guard isDown != rightOptionDown else { return }
         rightOptionDown = isDown
-        if isDown {
-            rightOptionPressed()
-        } else {
-            rightOptionReleased()
-        }
+        if isDown { rightOptionPressed() } else { rightOptionReleased() }
     }
 
     private func rightOptionPressed() {
         active = true
         renderIcon()
-        NSSound.beep()
-        logf("RIGHT OPTION DOWN (push-to-talk start)")
+        logf("RIGHT OPTION DOWN (start dictation)")
+        capture.start()
     }
 
     private func rightOptionReleased() {
         active = false
         renderIcon()
-        logf("RIGHT OPTION UP (push-to-talk end)")
+        logf("RIGHT OPTION UP (end dictation)")
+        let pcm = capture.stop()
+        Task {
+            let text = await Deepgram.transcribe(pcm)
+            guard let text, !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+                logf("dictation: empty transcript")
+                return
+            }
+            await MainActor.run { TextInjector.insert(text) }
+        }
     }
 }
 
@@ -121,5 +206,5 @@ logf("=== Vox starting (pid \(ProcessInfo.processInfo.processIdentifier)) ===")
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory) // no Dock icon, menu-bar only (LSUIElement equivalent)
+app.setActivationPolicy(.accessory)
 app.run()

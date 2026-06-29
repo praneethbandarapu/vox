@@ -1,7 +1,8 @@
 APP := Vox.app
 BIN := .build/release/Vox
 SOURCES := $(wildcard Sources/Vox/*.swift)
-FRAMEWORKS := -framework AppKit -framework Carbon
+FRAMEWORKS := -framework AppKit -framework Carbon -framework Security -framework AVFoundation -framework CoreGraphics
+SIGN_ID := Vox Dev
 
 # We compile with swiftc directly rather than `swift build`.
 # Reason: the Command Line Tools (no full Xcode) ship a buggy SwiftPM
@@ -19,7 +20,7 @@ bundle: build
 	mkdir -p $(APP)/Contents/MacOS
 	cp $(BIN) $(APP)/Contents/MacOS/Vox
 	cp Resources/Info.plist $(APP)/Contents/Info.plist
-	codesign --force --deep --sign - $(APP)
+	codesign --force --deep --sign "$(SIGN_ID)" $(APP)
 	@echo "Built $(APP)"
 
 run: bundle
