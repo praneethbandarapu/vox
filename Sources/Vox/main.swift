@@ -29,18 +29,23 @@ func logf(_ message: String) {
     NSLog("Vox: \(message)")
 }
 
-// Device-dependent modifier bit for the RIGHT Option key.
+// Device-dependent modifier bits for the RIGHT Option and RIGHT Command keys.
 let kRightOptionBit: UInt = 0x40
+let kRightCommandBit: UInt = 0x10
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var rightOptionDown = false
+    private var rightCommandDown = false
+    private enum Mode { case dictation, agent }
+    private var mode: Mode = .dictation
     private var active = false
     private let capture = AudioCapture()
     private var transcriber: Transcriber?
     private let indicator = RecordingIndicator()
+    private let agent = ClaudeAgent()
     private var historyWindow: NSWindow?
     private var pasteHotKeyRef: EventHotKeyRef?
     private var pasteHandlerRef: EventHandlerRef?
@@ -99,7 +104,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshMenu() {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Vox v0.0.3", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Trigger: hold Right Option", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Dictate: hold Right Option", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Command: hold Right Command", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
 
         // Deepgram (speech-to-text)
@@ -125,6 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanup.state = cleanupEnabled ? .on : .off
 
         menu.addItem(.separator())
+        addItem(to: menu, title: "Run Agent Test", action: #selector(runAgentTest))
         addItem(to: menu, title: "Dictation History…", action: #selector(showHistory))
         let login = addItem(to: menu, title: "Launch at Login", action: #selector(toggleLoginItem))
         login.state = loginEnabled ? .on : .off
@@ -171,6 +178,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanupEnabled.toggle()
         logf("cleanup enabled=\(cleanupEnabled)")
         refreshMenu()
+    }
+
+    // MARK: Agent test (temporary, validates the Swift -> claude bridge)
+
+    @objc private func runAgentTest() {
+        logf("[agent] test starting")
+        agent.run(prompt: "What is 2+2? Reply with only the number.", onEvent: { _ in }) { result in
+            logf("[agent] test completed: \(result ?? "nil")")
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Agent result"
+            alert.informativeText = result ?? "(no result, check /tmp/vox.log)"
+            alert.runModal()
+        }
     }
 
     // MARK: History window
@@ -282,58 +303,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleFlagsChanged(_ event: NSEvent) {
-        let isDown = (event.modifierFlags.rawValue & kRightOptionBit) != 0
-        guard isDown != rightOptionDown else { return }
-        rightOptionDown = isDown
-        if isDown { rightOptionPressed() } else { rightOptionReleased() }
+        let flags = event.modifierFlags.rawValue
+        let optDown = (flags & kRightOptionBit) != 0
+        if optDown != rightOptionDown {
+            rightOptionDown = optDown
+            optDown ? startListening(.dictation) : stopListening()
+        }
+        let cmdDown = (flags & kRightCommandBit) != 0
+        if cmdDown != rightCommandDown {
+            rightCommandDown = cmdDown
+            cmdDown ? startListening(.agent) : stopListening()
+        }
     }
 
-    private func rightOptionPressed() {
+    private func startListening(_ mode: Mode) {
+        guard transcriber == nil else { return } // already listening
         let t = ProviderFactory.makeTranscriber()
         guard t.isConfigured else {
-            logf("dictation: STT provider not configured")
+            logf("STT provider not configured")
             NSSound.beep()
             return
         }
+        self.mode = mode
         active = true
         renderIcon()
         indicator.show()
         playSound("Tink")
-        logf("RIGHT OPTION DOWN (start dictation)")
-
+        logf("listening (mode=\(mode))")
         t.start()
         transcriber = t
         capture.onChunk = { [weak t] data in t?.send(data) }
         capture.start()
     }
 
-    private func rightOptionReleased() {
+    private func stopListening() {
+        guard let t = transcriber else { return }
         active = false
         renderIcon()
         indicator.hide()
-        logf("RIGHT OPTION UP (end dictation)")
         _ = capture.stop()
         capture.onChunk = nil
-        let t = transcriber
         transcriber = nil
-
-        let cleaner = ProviderFactory.makeCleaner()
-        let shouldClean = cleanupEnabled && cleaner.isConfigured
+        let mode = self.mode
 
         Task {
-            var text = (await t?.finish() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { logf("dictation: empty transcript"); return }
-            if shouldClean,
-               let cleaned = await cleaner.clean(text)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !cleaned.isEmpty {
-                text = cleaned
+            let text = (await t.finish()).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { logf("empty transcript"); return }
+            switch mode {
+            case .dictation:
+                var out = text
+                let cleaner = ProviderFactory.makeCleaner()
+                if cleanupEnabled && cleaner.isConfigured,
+                   let cleaned = await cleaner.clean(text)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !cleaned.isEmpty {
+                    out = cleaned
+                }
+                let finalText = out
+                await MainActor.run {
+                    HistoryStore.add(finalText)               // never lose it
+                    let delivered = TextInjector.deliver(finalText)
+                    self.playSound(delivered ? "Pop" : "Funk") // Funk = buffered, use Cmd+Shift+V
+                }
+            case .agent:
+                await MainActor.run { self.runAgentCommand(text) }
             }
-            let finalText = text
-            await MainActor.run {
-                HistoryStore.add(finalText)               // never lose it
-                let delivered = TextInjector.deliver(finalText)
-                self.playSound(delivered ? "Pop" : "Funk") // Funk = buffered, use Cmd+Shift+V
+        }
+    }
+
+    // Sends a spoken command to Claude Code to perform a real action. For this
+    // first test we allow the Bash tool so Claude can act via osascript/AppleScript
+    // (e.g. create a Calendar event) with no MCP connector required.
+    private func runAgentCommand(_ command: String) {
+        logf("[agent] command: \(command)")
+        indicator.show("● Working…")
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let mcpPath = home + "/.vox/vox-mcp.json"
+        let env = [
+            "GOOGLE_OAUTH_CREDENTIALS": "\(home)/.vox/gcp-oauth.keys.json",
+            "GOOGLE_CALENDAR_MCP_TOKEN_PATH": "\(home)/.vox/tokens.json"
+        ]
+        let config: [String: Any] = [
+            "mcpServers": [
+                "google-calendar": [
+                    "command": "npx",
+                    "args": ["@cocal/google-calendar-mcp"],
+                    "env": env
+                ]
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: config) {
+            try? data.write(to: URL(fileURLWithPath: mcpPath))
+        }
+
+        let prompt = """
+        You are Vox, an assistant that performs actions on the user's Mac. You have a Google Calendar tool (list/create/update/delete events).
+        The user's spoken command was: "\(command)"
+        Carry it out now using your tools. Do not ask questions; make reasonable assumptions (default event duration 30 minutes; pick a sensible near-future time if unspecified). Then reply with ONE short sentence confirming exactly what you did.
+        """
+
+        agent.run(prompt: prompt,
+                  allowedTools: ["mcp__google-calendar"],
+                  mcpConfigPath: mcpPath,
+                  strictMcp: true,
+                  onEvent: { event in
+            if case let .toolUse(name, input) = event.kind {
+                logf("[agent] using \(name): \(input.prefix(160))")
             }
+        }) { result in
+            self.indicator.hide()
+            self.playSound("Glass")
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Vox agent"
+            alert.informativeText = result ?? "(no result, see /tmp/vox.log)"
+            alert.runModal()
         }
     }
 }

@@ -8,9 +8,10 @@ final class RecordingIndicator {
     private var panel: NSPanel?
     private let label = NSTextField(labelWithString: "● Listening…")
 
-    func show() {
+    func show(_ text: String = "● Listening…") {
         let p = panel ?? makePanel()
         panel = p
+        label.stringValue = text
         position(p)
         p.orderFrontRegardless()
     }
