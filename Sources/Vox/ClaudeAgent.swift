@@ -20,8 +20,10 @@ final class ClaudeAgent {
 
     func run(prompt: String,
              allowedTools: [String] = [],
+             disallowedTools: [String] = [],
              mcpConfigPath: String? = nil,
              strictMcp: Bool = false,
+             workingDir: String? = nil,
              onEvent: @escaping (AgentEvent) -> Void,
              completion: @escaping (String?) -> Void) {
 
@@ -34,11 +36,15 @@ final class ClaudeAgent {
         if !allowedTools.isEmpty {
             command += " --allowedTools \"\(allowedTools.joined(separator: ","))\""
         }
+        if !disallowedTools.isEmpty {
+            command += " --disallowedTools \"\(disallowedTools.joined(separator: ","))\""
+        }
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/zsh")
         task.arguments = ["-lc", command]
-        task.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        task.currentDirectoryURL = workingDir.map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
 
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -85,6 +91,16 @@ final class ClaudeAgent {
             completion(nil)
         }
     }
+
+    // Kill an in-flight run (e.g. a speculative plan the user invalidated by editing).
+    func cancel() {
+        process?.terminationHandler = nil
+        process?.terminate()
+        process = nil
+    }
+
+    // Forget the session so the next run starts fresh (used when re-planning edited text).
+    func reset() { sessionId = nil }
 
     private func handleLine(_ line: String,
                             onEvent: (AgentEvent) -> Void,

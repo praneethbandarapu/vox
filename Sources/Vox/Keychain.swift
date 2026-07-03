@@ -8,6 +8,11 @@ import Security
 enum Keychain {
     static let service = "ai.vox"
 
+    // In-memory cache so a key is decrypted from the Keychain at most once per
+    // session (avoids a permission prompt on every read).
+    private static let cacheLock = NSLock()
+    private static var cache: [String: String] = [:]
+
     @discardableResult
     static func set(_ value: String, account: String) -> Bool {
         let data = Data(value.utf8)
@@ -22,6 +27,9 @@ enum Keychain {
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         let status = SecItemAdd(add as CFDictionary, nil)
+        if status == errSecSuccess {
+            cacheLock.lock(); cache[account] = value; cacheLock.unlock()
+        }
         return status == errSecSuccess
     }
 
@@ -40,6 +48,10 @@ enum Keychain {
     }
 
     static func get(account: String) -> String? {
+        cacheLock.lock()
+        if let cached = cache[account] { cacheLock.unlock(); return cached }
+        cacheLock.unlock()
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -49,8 +61,10 @@ enum Keychain {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess, let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        guard status == errSecSuccess, let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        cacheLock.lock(); cache[account] = value; cacheLock.unlock()
+        return value
     }
 
     @discardableResult
@@ -61,6 +75,7 @@ enum Keychain {
             kSecAttrAccount as String: account
         ]
         let status = SecItemDelete(query as CFDictionary)
+        cacheLock.lock(); cache[account] = nil; cacheLock.unlock()
         return status == errSecSuccess || status == errSecItemNotFound
     }
 }

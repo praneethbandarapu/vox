@@ -41,6 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rightCommandDown = false
     private enum Mode { case dictation, agent }
     private var mode: Mode = .dictation
+    private var cachedIntent: ParsedIntent?
+    private var onIntentReady: ((ParsedIntent) -> Void)?
+    private var parseGen = 0   // only the latest parse's result is accepted
     private var active = false
     private let capture = AudioCapture()
     private var transcriber: Transcriber?
@@ -365,7 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.playSound(delivered ? "Pop" : "Funk") // Funk = buffered, use Cmd+Shift+V
                 }
             case .agent:
-                await MainActor.run { self.runAgentCommand(text) }
+                await MainActor.run { self.startAgentFlow(text) }
             }
         }
     }
@@ -373,52 +376,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Sends a spoken command to Claude Code to perform a real action. For this
     // first test we allow the Bash tool so Claude can act via osascript/AppleScript
     // (e.g. create a Calendar event) with no MCP connector required.
-    private func runAgentCommand(_ command: String) {
-        logf("[agent] command: \(command)")
-        indicator.show("● Working…")
+    // Fast path: Groq parses the command into a structured calendar intent, then
+    // Vox calls Google Calendar directly. Claude Code remains the future fallback.
 
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let mcpPath = home + "/.vox/vox-mcp.json"
-        let env = [
-            "GOOGLE_OAUTH_CREDENTIALS": "\(home)/.vox/gcp-oauth.keys.json",
-            "GOOGLE_CALENDAR_MCP_TOKEN_PATH": "\(home)/.vox/tokens.json"
-        ]
-        let config: [String: Any] = [
-            "mcpServers": [
-                "google-calendar": [
-                    "command": "npx",
-                    "args": ["@cocal/google-calendar-mcp"],
-                    "env": env
-                ]
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: config) {
-            try? data.write(to: URL(fileURLWithPath: mcpPath))
+    // Gate 1 + speculative Groq parse (runs in parallel with the transcript screen).
+    private func startAgentFlow(_ originalTranscript: String) {
+        cachedIntent = nil
+        onIntentReady = nil
+        parseIntent(originalTranscript)   // speculative
+
+        guard let edited = promptEditableTranscript(originalTranscript) else {
+            logf("[agent] cancelled at transcript")
+            indicator.hide()
+            return
         }
 
-        let prompt = """
-        You are Vox, an assistant that performs actions on the user's Mac. You have a Google Calendar tool (list/create/update/delete events).
-        The user's spoken command was: "\(command)"
-        Carry it out now using your tools. Do not ask questions; make reasonable assumptions (default event duration 30 minutes; pick a sensible near-future time if unspecified). Then reply with ONE short sentence confirming exactly what you did.
-        """
-
-        agent.run(prompt: prompt,
-                  allowedTools: ["mcp__google-calendar"],
-                  mcpConfigPath: mcpPath,
-                  strictMcp: true,
-                  onEvent: { event in
-            if case let .toolUse(name, input) = event.kind {
-                logf("[agent] using \(name): \(input.prefix(160))")
+        if edited == originalTranscript {
+            if let intent = cachedIntent {
+                handleIntent(intent)
+            } else {
+                indicator.show("● Thinking…")
+                onIntentReady = { [weak self] intent in self?.handleIntent(intent) }
             }
-        }) { result in
-            self.indicator.hide()
-            self.playSound("Glass")
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            alert.messageText = "Vox agent"
-            alert.informativeText = result ?? "(no result, see /tmp/vox.log)"
-            alert.runModal()
+        } else {
+            // Corrected text: re-parse.
+            cachedIntent = nil
+            indicator.show("● Thinking…")
+            onIntentReady = { [weak self] intent in self?.handleIntent(intent) }
+            parseIntent(edited)
         }
+    }
+
+    private func parseIntent(_ command: String) {
+        parseGen += 1
+        let gen = parseGen
+        indicator.show("● Thinking…")
+        Task {
+            let intent = await GroqIntent.parse(command)
+            await MainActor.run {
+                guard gen == self.parseGen else { return }   // stale (input changed); drop
+                if let cb = self.onIntentReady { self.onIntentReady = nil; cb(intent) }
+                else { self.cachedIntent = intent }
+            }
+        }
+    }
+
+    private func handleIntent(_ intent: ParsedIntent) {
+        switch intent {
+        case .calendar(let ci):
+            confirmAndCreate(ci)
+        case .other:
+            indicator.hide()
+            showAlert("Vox", "That doesn't look like a calendar command. Slack, email, and a general fallback are coming next.")
+        case .failed:
+            indicator.hide()
+            showAlert("Vox", "Sorry, couldn't understand that. See /tmp/vox.log.")
+        }
+    }
+
+    // Gate 2: confirm the exact event, then call Google Calendar directly.
+    private func confirmAndCreate(_ ci: CalendarIntent) {
+        indicator.hide()
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Create this calendar event?"
+        alert.informativeText = describe(ci)
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            logf("[agent] calendar action cancelled")
+            return
+        }
+        indicator.show("● Working…")
+        Task {
+            let result = await GoogleCalendar.createEvent(ci)
+            await MainActor.run {
+                self.indicator.hide()
+                self.playSound(result != nil ? "Glass" : "Funk")
+                self.showAlert("Vox", result != nil ? "Created: \(ci.summary)" : "Failed to create the event. See /tmp/vox.log.")
+            }
+        }
+    }
+
+    private func describe(_ ci: CalendarIntent) -> String {
+        let who = ci.attendees.isEmpty ? "just you (no invite)" : ci.attendees.joined(separator: ", ")
+        return "\(ci.summary)\n\(prettyTime(ci.startISO)) to \(prettyTime(ci.endISO)) (\(ci.timeZone))\nAttendees: \(who)"
+    }
+
+    private func prettyTime(_ iso: String) -> String {
+        let parser = DateFormatter()
+        parser.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let pretty = DateFormatter()
+        pretty.dateFormat = "EEE MMM d, h:mm a"
+        if let d = parser.date(from: iso) { return pretty.string(from: d) }
+        return iso
+    }
+
+    private func promptEditableTranscript(_ transcript: String) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Command"
+        alert.informativeText = "Vox heard this. Edit if needed, then Run."
+        alert.addButton(withTitle: "Run")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        field.stringValue = transcript
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn
+            ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+    }
+
+    private func showAlert(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.runModal()
     }
 }
 
