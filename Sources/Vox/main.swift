@@ -135,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         addItem(to: menu, title: "Run Agent Test", action: #selector(runAgentTest))
+        addItem(to: menu, title: "Test MCP Bridge", action: #selector(testMCPBridge))
         addItem(to: menu, title: "Dictation History…", action: #selector(showHistory))
         let login = addItem(to: menu, title: "Launch at Login", action: #selector(toggleLoginItem))
         login.state = loginEnabled ? .on : .off
@@ -194,6 +195,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.messageText = "Agent result"
             alert.informativeText = result ?? "(no result, check /tmp/vox.log)"
             alert.runModal()
+        }
+    }
+
+    // MARK: MCP bridge test (temporary)
+
+    @objc private func testMCPBridge() {
+        logf("[mcp] test starting")
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let cmd = "GOOGLE_OAUTH_CREDENTIALS=\"\(home)/.vox/gcp-oauth.keys.json\" GOOGLE_CALENDAR_MCP_TOKEN_PATH=\"\(home)/.vox/tokens.json\" exec npx @cocal/google-calendar-mcp"
+        let client = MCPClient()
+        Task {
+            do {
+                try client.start(shellCommand: cmd)
+                let info = try await client.initialize()
+                logf("[mcp] initialized serverInfo=\(info["serverInfo"] ?? [:])")
+                let tools = try await client.listTools()
+                let names = tools.compactMap { $0["name"] as? String }
+                logf("[mcp] \(names.count) tools: \(names.prefix(12))")
+                let result = try await client.callTool("list-calendars", arguments: [:])
+                logf("[mcp] list-calendars -> \(result.prefix(300))")
+                await MainActor.run {
+                    self.showAlert("MCP bridge", "Connected. \(names.count) tools.\n\nlist-calendars:\n\(result.prefix(400))")
+                }
+                client.stop()
+            } catch {
+                logf("[mcp] error: \(error)")
+                await MainActor.run { self.showAlert("MCP bridge", "Error: \(error)") }
+                client.stop()
+            }
         }
     }
 
