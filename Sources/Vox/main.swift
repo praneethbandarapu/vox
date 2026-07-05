@@ -14,6 +14,7 @@ let logPath = "/tmp/vox.log"
 let deepgramAccount = "deepgram-api-key"
 let anthropicAccount = "anthropic-api-key"
 let groqAccount = "groq-api-key"
+let slackAccount = "slack-bot-token"
 
 func logf(_ message: String) {
     let line = "[\(Date())] \(message)\n"
@@ -134,8 +135,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanup.state = cleanupEnabled ? .on : .off
 
         menu.addItem(.separator())
-        addItem(to: menu, title: "Run Agent Test", action: #selector(runAgentTest))
-        addItem(to: menu, title: "Test MCP Bridge", action: #selector(testMCPBridge))
+        menu.addItem(NSMenuItem(title: "Connectors", action: nil, keyEquivalent: ""))
+        for def in ConnectorManager.defs {
+            menu.addItem(NSMenuItem(title: "  \(def.displayName): \(def.isConfigured() ? "connected" : "not connected")",
+                                    action: nil, keyEquivalent: ""))
+        }
+        addItem(to: menu, title: "Connect Google (Calendar + Gmail)…", action: #selector(connectGoogle))
+        addItem(to: menu, title: "Set Slack Token…", action: #selector(showSetSlackKey))
+        addItem(to: menu, title: "Test Connectors", action: #selector(testConnectors))
+
+        menu.addItem(.separator())
         addItem(to: menu, title: "Dictation History…", action: #selector(showHistory))
         let login = addItem(to: menu, title: "Launch at Login", action: #selector(toggleLoginItem))
         login.state = loginEnabled ? .on : .off
@@ -198,32 +207,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: MCP bridge test (temporary)
+    // MARK: Connectors
 
-    @objc private func testMCPBridge() {
-        logf("[mcp] test starting")
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let cmd = "GOOGLE_OAUTH_CREDENTIALS=\"\(home)/.vox/gcp-oauth.keys.json\" GOOGLE_CALENDAR_MCP_TOKEN_PATH=\"\(home)/.vox/tokens.json\" exec npx @cocal/google-calendar-mcp"
-        let client = MCPClient()
+    @objc private func showSetSlackKey() { promptForKey(label: "Slack", account: slackAccount) }
+
+    @objc private func connectGoogle() {
+        logf("[google] connect starting")
         Task {
-            do {
-                try client.start(shellCommand: cmd)
-                let info = try await client.initialize()
-                logf("[mcp] initialized serverInfo=\(info["serverInfo"] ?? [:])")
-                let tools = try await client.listTools()
-                let names = tools.compactMap { $0["name"] as? String }
-                logf("[mcp] \(names.count) tools: \(names.prefix(12))")
-                let result = try await client.callTool("list-calendars", arguments: [:])
-                logf("[mcp] list-calendars -> \(result.prefix(300))")
-                await MainActor.run {
-                    self.showAlert("MCP bridge", "Connected. \(names.count) tools.\n\nlist-calendars:\n\(result.prefix(400))")
-                }
-                client.stop()
-            } catch {
-                logf("[mcp] error: \(error)")
-                await MainActor.run { self.showAlert("MCP bridge", "Error: \(error)") }
-                client.stop()
+            let ok = await GoogleAuth.connect()
+            await MainActor.run {
+                self.showAlert("Google", ok ? "Connected: Calendar + Gmail (as you)." : "Connection failed. See /tmp/vox.log.")
+                self.refreshMenu()
             }
+        }
+    }
+
+    @objc private func testConnectors() {
+        logf("[conn] test starting")
+        Task {
+            var summary = ""
+            for def in ConnectorManager.defs {
+                guard def.isConfigured() else { summary += "\(def.displayName): not connected\n\n"; continue }
+                let tools = await ConnectorManager.shared.listTools(def.id)
+                summary += "\(def.displayName): \(tools.count) tools\n"
+                if def.id == "google-calendar" {
+                    let r = await ConnectorManager.shared.call(def.id, tool: "list-calendars", arguments: [:])
+                    summary += "  list-calendars: \(r?.prefix(120) ?? "nil")\n"
+                } else if def.id == "slack" {
+                    let listTool = tools.first { $0.lowercased().contains("channel") && $0.lowercased().contains("list") }
+                        ?? tools.first { $0.lowercased().contains("conversation") }
+                    if let listTool {
+                        let r = await ConnectorManager.shared.call(def.id, tool: listTool, arguments: [:])
+                        summary += "  \(listTool): \(r?.prefix(120) ?? "nil/err")\n"
+                    }
+                }
+                summary += "\n"
+            }
+            await MainActor.run { self.showAlert("Connectors", summary.isEmpty ? "none" : summary) }
         }
     }
 

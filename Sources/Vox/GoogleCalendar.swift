@@ -51,6 +51,10 @@ enum GoogleCalendar {
     // MARK: Token handling
 
     private static func validAccessToken() async -> String? {
+        // Prefer our own OAuth token store; fall back to the legacy npx token file.
+        if TokenStore.exists(GoogleAuth.provider) {
+            return await GoogleAuth.accessToken()
+        }
         guard let normal = loadNormalTokens() else { return nil }
         let access = normal["access_token"] as? String
         let expiry = (normal["expiry_date"] as? Double) ?? 0   // ms since epoch

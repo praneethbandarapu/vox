@@ -1,7 +1,7 @@
 APP := Vox.app
 BIN := .build/release/Vox
 SOURCES := $(wildcard Sources/Vox/*.swift)
-FRAMEWORKS := -framework AppKit -framework Carbon -framework Security -framework AVFoundation -framework CoreGraphics -framework SwiftUI -framework ServiceManagement
+FRAMEWORKS := -framework AppKit -framework Carbon -framework Security -framework AVFoundation -framework CoreGraphics -framework SwiftUI -framework ServiceManagement -framework Network -framework CryptoKit
 SIGN_ID := Vox Dev
 
 # We compile with swiftc directly rather than `swift build`.
