@@ -36,8 +36,32 @@ enum GoogleAuth {
         guard let cfg = config() else { return false }
         guard let tokens = await OAuthFlow.authorize(cfg) else { return false }
         TokenStore.save(provider, tokens)
+        writeServerCredentials(tokens)
         logf("[google] connected (calendar + gmail)")
         return true
+    }
+
+    // Write our OAuth token into the credential files the MCP servers read, so a
+    // single in-app "Connect Google" powers both the calendar and Gmail servers
+    // (no per-server `npx auth`). Both servers self-refresh via the refresh token.
+    static func writeServerCredentials(_ t: OAuthTokens) {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let cred: [String: Any] = [
+            "access_token": t.access,
+            "refresh_token": t.refresh ?? "",
+            "scope": "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.modify",
+            "token_type": "Bearer",
+            "expiry_date": t.expiryMs
+        ]
+        // Gmail server (@gongrzhe): top-level credentials object.
+        if let data = try? JSONSerialization.data(withJSONObject: cred) {
+            try? data.write(to: URL(fileURLWithPath: home + "/.vox/gmail-credentials.json"))
+        }
+        // Calendar server (@cocal): wraps the same object under "normal".
+        if let data = try? JSONSerialization.data(withJSONObject: ["normal": cred]) {
+            try? data.write(to: URL(fileURLWithPath: home + "/.vox/tokens.json"))
+        }
+        logf("[google] wrote MCP server credentials (calendar + gmail)")
     }
 
     // A valid access token, refreshing via the stored refresh token if expired.

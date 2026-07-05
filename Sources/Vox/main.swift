@@ -215,8 +215,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logf("[google] connect starting")
         Task {
             let ok = await GoogleAuth.connect()
+            ConnectorManager.shared.shutdown()   // restart servers with the fresh token
             await MainActor.run {
-                self.showAlert("Google", ok ? "Connected: Calendar + Gmail (as you)." : "Connection failed. See /tmp/vox.log.")
+                self.showAlert("Google", ok ? "Connected: Calendar + Gmail (via bridge)." : "Connection failed. See /tmp/vox.log.")
                 self.refreshMenu()
             }
         }
@@ -233,6 +234,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if def.id == "google-calendar" {
                     let r = await ConnectorManager.shared.call(def.id, tool: "list-calendars", arguments: [:])
                     summary += "  list-calendars: \(r?.prefix(120) ?? "nil")\n"
+                } else if def.id == "gmail" {
+                    let listTool = tools.first { $0.lowercased().contains("label") }
+                        ?? tools.first { $0.lowercased().contains("search") }
+                    if let listTool {
+                        let r = await ConnectorManager.shared.call(def.id, tool: listTool, arguments: [:])
+                        summary += "  \(listTool): \(r?.prefix(120) ?? "nil/err")\n"
+                    }
                 } else if def.id == "slack" {
                     let listTool = tools.first { $0.lowercased().contains("channel") && $0.lowercased().contains("list") }
                         ?? tools.first { $0.lowercased().contains("conversation") }
@@ -499,7 +507,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         indicator.show("● Working…")
         Task {
-            let result = await GoogleCalendar.createEvent(ci)
+            let args: [String: Any] = [
+                "calendarId": "primary",
+                "summary": ci.summary,
+                "start": ci.startISO,
+                "end": ci.endISO,
+                "timeZone": ci.timeZone,
+                "attendees": ci.attendees.map { ["email": $0] }
+            ]
+            let result = await ConnectorManager.shared.call("google-calendar", tool: "create-event", arguments: args)
             await MainActor.run {
                 self.indicator.hide()
                 self.playSound(result != nil ? "Glass" : "Funk")

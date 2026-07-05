@@ -31,6 +31,15 @@ final class ConnectorManager {
                 }
             ),
             ConnectorDef(
+                id: "gmail",
+                displayName: "Gmail",
+                isConfigured: { FileManager.default.fileExists(atPath: home + "/.vox/gmail-credentials.json") },
+                makeCommand: {
+                    guard FileManager.default.fileExists(atPath: home + "/.vox/gmail-credentials.json") else { return nil }
+                    return "GMAIL_OAUTH_PATH=\"\(home)/.vox/gcp-oauth.keys.json\" GMAIL_CREDENTIALS_PATH=\"\(home)/.vox/gmail-credentials.json\" exec npx @gongrzhe/server-gmail-autoauth-mcp"
+                }
+            ),
+            ConnectorDef(
                 id: "slack",
                 displayName: "Slack",
                 isConfigured: { Keychain.exists(account: slackAccount) },
