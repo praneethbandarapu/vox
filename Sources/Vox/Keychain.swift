@@ -1,81 +1,68 @@
 import Foundation
-import Security
 
-// Thin wrapper over the macOS Keychain (Security framework).
-// Secrets are stored encrypted by the OS, scoped to this user.
-// Nothing here ever writes a secret to disk in plaintext or to the repo.
+// Secret store. Backed by a chmod-600 JSON file at ~/.vox/secrets.json
+// (owner-only, outside the repo), not the macOS Keychain.
+//
+// Why not the Keychain: without an Apple Developer team ID, the Keychain
+// re-prompts for access on every rebuild/update because the app's signature
+// changes and it can't recognize "the same app". A user-only file (the same
+// pattern as ~/.aws/credentials, and where our gcp-oauth.keys.json already
+// lives) avoids that entirely. Move back to the Keychain if the app is ever
+// signed with a real Developer ID. (Type kept named `Keychain` for now to
+// avoid churn across call sites.)
 
 enum Keychain {
-    static let service = "ai.vox"
+    private static var path: String {
+        FileManager.default.homeDirectoryForCurrentUser.path + "/.vox/secrets.json"
+    }
+    private static let lock = NSLock()
+    private static var cache: [String: String]?
 
-    // In-memory cache so a key is decrypted from the Keychain at most once per
-    // session (avoids a permission prompt on every read).
-    private static let cacheLock = NSLock()
-    private static var cache: [String: String] = [:]
-
-    @discardableResult
-    static func set(_ value: String, account: String) -> Bool {
-        let data = Data(value.utf8)
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        // Replace any existing item.
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(add as CFDictionary, nil)
-        if status == errSecSuccess {
-            cacheLock.lock(); cache[account] = value; cacheLock.unlock()
+    private static func loadAll() -> [String: String] {
+        if let cache { return cache }
+        var dict: [String: String] = [:]
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            dict = obj
         }
-        return status == errSecSuccess
+        cache = dict
+        return dict
     }
 
-    // Checks whether a secret exists WITHOUT decrypting it. Reading only the
-    // attributes (not the data) does not trigger a Keychain access prompt, so
-    // this is safe to call at startup / when building the menu.
-    static func exists(account: String) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: false,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+    private static func saveAll(_ dict: [String: String]) {
+        cache = dict
+        let dir = FileManager.default.homeDirectoryForCurrentUser.path + "/.vox"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
+        try? data.write(to: URL(fileURLWithPath: path))
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
     }
 
     static func get(account: String) -> String? {
-        cacheLock.lock()
-        if let cached = cache[account] { cacheLock.unlock(); return cached }
-        cacheLock.unlock()
+        lock.lock(); defer { lock.unlock() }
+        return loadAll()[account]
+    }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess, let data = item as? Data,
-              let value = String(data: data, encoding: .utf8) else { return nil }
-        cacheLock.lock(); cache[account] = value; cacheLock.unlock()
-        return value
+    static func exists(account: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return loadAll()[account] != nil
+    }
+
+    @discardableResult
+    static func set(_ value: String, account: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        var dict = loadAll()
+        dict[account] = value
+        saveAll(dict)
+        return true
     }
 
     @discardableResult
     static func delete(account: String) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        cacheLock.lock(); cache[account] = nil; cacheLock.unlock()
-        return status == errSecSuccess || status == errSecItemNotFound
+        lock.lock(); defer { lock.unlock() }
+        var dict = loadAll()
+        dict[account] = nil
+        saveAll(dict)
+        return true
     }
 }
