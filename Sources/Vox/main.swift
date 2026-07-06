@@ -42,9 +42,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rightCommandDown = false
     private enum Mode { case dictation, agent }
     private var mode: Mode = .dictation
-    private var cachedIntent: ParsedIntent?
-    private var onIntentReady: ((ParsedIntent) -> Void)?
-    private var parseGen = 0   // only the latest parse's result is accepted
     private var active = false
     private let capture = AudioCapture()
     private var transcriber: Transcriber?
@@ -437,105 +434,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Fast path: Groq parses the command into a structured calendar intent, then
     // Vox calls Google Calendar directly. Claude Code remains the future fallback.
 
-    // Gate 1 + speculative Groq parse (runs in parallel with the transcript screen).
+    // Gate 1 (editable transcript) -> Router (tool-calling over all connectors)
+    // -> per-tool confirm -> execute via the bridge -> result.
     private func startAgentFlow(_ originalTranscript: String) {
-        cachedIntent = nil
-        onIntentReady = nil
-        parseIntent(originalTranscript)   // speculative
-
-        guard let edited = promptEditableTranscript(originalTranscript) else {
+        guard let command = promptEditableTranscript(originalTranscript), !command.isEmpty else {
             logf("[agent] cancelled at transcript")
             indicator.hide()
             return
         }
-
-        if edited == originalTranscript {
-            if let intent = cachedIntent {
-                handleIntent(intent)
-            } else {
-                indicator.show("● Thinking…")
-                onIntentReady = { [weak self] intent in self?.handleIntent(intent) }
-            }
-        } else {
-            // Corrected text: re-parse.
-            cachedIntent = nil
-            indicator.show("● Thinking…")
-            onIntentReady = { [weak self] intent in self?.handleIntent(intent) }
-            parseIntent(edited)
-        }
-    }
-
-    private func parseIntent(_ command: String) {
-        parseGen += 1
-        let gen = parseGen
         indicator.show("● Thinking…")
         Task {
-            let intent = await GroqIntent.parse(command)
-            await MainActor.run {
-                guard gen == self.parseGen else { return }   // stale (input changed); drop
-                if let cb = self.onIntentReady { self.onIntentReady = nil; cb(intent) }
-                else { self.cachedIntent = intent }
-            }
-        }
-    }
-
-    private func handleIntent(_ intent: ParsedIntent) {
-        switch intent {
-        case .calendar(let ci):
-            confirmAndCreate(ci)
-        case .other:
-            indicator.hide()
-            showAlert("Vox", "That doesn't look like a calendar command. Slack, email, and a general fallback are coming next.")
-        case .failed:
-            indicator.hide()
-            showAlert("Vox", "Sorry, couldn't understand that. See /tmp/vox.log.")
-        }
-    }
-
-    // Gate 2: confirm the exact event, then call Google Calendar directly.
-    private func confirmAndCreate(_ ci: CalendarIntent) {
-        indicator.hide()
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Create this calendar event?"
-        alert.informativeText = describe(ci)
-        alert.addButton(withTitle: "Create")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            logf("[agent] calendar action cancelled")
-            return
-        }
-        indicator.show("● Working…")
-        Task {
-            let args: [String: Any] = [
-                "calendarId": "primary",
-                "summary": ci.summary,
-                "start": ci.startISO,
-                "end": ci.endISO,
-                "timeZone": ci.timeZone,
-                "attendees": ci.attendees.map { ["email": $0] }
-            ]
-            let result = await ConnectorManager.shared.call("google-calendar", tool: "create-event", arguments: args)
+            let result = await Router.run(
+                command: command,
+                confirm: { [weak self] proposed in await self?.confirmToolCall(proposed) ?? false },
+                onStatus: { [weak self] status in
+                    DispatchQueue.main.async { self?.indicator.show("● \(status)") }
+                }
+            )
             await MainActor.run {
                 self.indicator.hide()
-                self.playSound(result != nil ? "Glass" : "Funk")
-                self.showAlert("Vox", result != nil ? "Created: \(ci.summary)" : "Failed to create the event. See /tmp/vox.log.")
+                self.playSound("Glass")
+                self.showAlert("Vox", result)
             }
         }
     }
 
-    private func describe(_ ci: CalendarIntent) -> String {
-        let who = ci.attendees.isEmpty ? "just you (no invite)" : ci.attendees.joined(separator: ", ")
-        return "\(ci.summary)\n\(prettyTime(ci.startISO)) to \(prettyTime(ci.endISO)) (\(ci.timeZone))\nAttendees: \(who)"
-    }
-
-    private func prettyTime(_ iso: String) -> String {
-        let parser = DateFormatter()
-        parser.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        let pretty = DateFormatter()
-        pretty.dateFormat = "EEE MMM d, h:mm a"
-        if let d = parser.date(from: iso) { return pretty.string(from: d) }
-        return iso
+    private func confirmToolCall(_ proposed: Router.ProposedCall) async -> Bool {
+        await MainActor.run {
+            self.indicator.hide()
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Run \(proposed.connector) · \(proposed.tool)?"
+            alert.informativeText = proposed.argsJSON
+            alert.addButton(withTitle: "Approve")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
     }
 
     private func promptEditableTranscript(_ transcript: String) -> String? {

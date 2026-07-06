@@ -81,6 +81,12 @@ final class ConnectorManager {
         return ((try? await client.listTools()) ?? []).compactMap { $0["name"] as? String }
     }
 
+    // Full tool definitions (name, description, inputSchema) for the router.
+    func toolDefs(_ id: String) async -> [[String: Any]] {
+        guard let client = await client(for: id) else { return [] }
+        return (try? await client.listTools()) ?? []
+    }
+
     func call(_ id: String, tool: String, arguments: [String: Any]) async -> String? {
         guard let client = await client(for: id) else { return nil }
         do { return try await client.callTool(tool, arguments: arguments) }
