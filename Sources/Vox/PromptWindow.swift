@@ -1,8 +1,17 @@
 import SwiftUI
 import AppKit
 
-// The interactive command window: shows the (editable) transcript, live status,
-// inline tool-call approvals, and the result. Replaces the stack of NSAlerts.
+// The interactive command panel: a right-docked, collapsible chat window that
+// owns the whole agent interaction (editable transcript, live status, inline
+// tool approval, result, follow-ups). Borderless + material background for a
+// "cloud chat" look.
+
+// Borderless windows refuse key status by default; override so the input field
+// can take focus and keystrokes.
+final class PanelWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
 
 @MainActor
 final class VoxSession: ObservableObject {
@@ -17,6 +26,7 @@ final class VoxSession: ObservableObject {
     @Published var lines: [Line] = []
     @Published var pending: Router.ProposedCall?
     @Published var running = false
+    @Published var collapsed = false
     @Published var focusTick = 0   // bumps on reset so the view refocuses the field
 
     private var confirmCont: CheckedContinuation<Bool, Never>?
@@ -26,6 +36,7 @@ final class VoxSession: ObservableObject {
         lines = []
         pending = nil
         running = false
+        collapsed = false
         confirmCont = nil
         focusTick += 1
     }
@@ -49,7 +60,6 @@ final class VoxSession: ObservableObject {
         }
     }
 
-    // Called by the router; shows the proposed tool call and waits for a button.
     func confirm(_ proposed: Router.ProposedCall) async -> Bool {
         pending = proposed
         return await withCheckedContinuation { cont in self.confirmCont = cont }
@@ -71,73 +81,167 @@ final class VoxSession: ObservableObject {
 
 struct PromptView: View {
     @ObservedObject var session: VoxSession
+    var onCollapse: () -> Void
+    var onClose: () -> Void
     @FocusState private var commandFocused: Bool
+    @Environment(\.colorScheme) private var scheme
+
+    // Claude-like warm palette.
+    private var paper: Color {
+        scheme == .dark ? Color(red: 0.15, green: 0.15, blue: 0.14) : Color(red: 0.98, green: 0.97, blue: 0.945)
+    }
+    private var userBubble: Color {
+        scheme == .dark ? Color.white.opacity(0.09) : Color(red: 0.93, green: 0.92, blue: 0.885)
+    }
+    private var fieldBg: Color {
+        scheme == .dark ? Color.white.opacity(0.06) : Color.white
+    }
+    private let accent = Color(red: 0.80, green: 0.44, blue: 0.32) // Claude coral
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Vox").font(.headline)
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(session.lines) { line in row(line).id(line.id) }
-                        Color.clear.frame(height: 1).id("bottom")
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: .infinity)
-                .onChange(of: session.lines.count) { _ in
-                    withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-                }
-                .onChange(of: session.pending?.tool) { _ in
-                    withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-                }
-            }
-
-            if let pending = session.pending {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Run \(pending.connector) · \(pending.tool)?").font(.subheadline).bold()
-                    Text(pending.argsJSON)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    HStack {
-                        Button("Approve") { session.resolve(true) }.keyboardShortcut(.defaultAction)
-                        Button("Cancel") { session.resolve(false) }
-                    }
-                }
-                .padding(10)
-                .background(Color.accentColor.opacity(0.12))
-                .cornerRadius(8)
-            }
-
-            HStack {
-                TextField("Command…", text: $session.command, onCommit: { session.run() })
-                    .textFieldStyle(.roundedBorder)
-                    .focused($commandFocused)
-                    .disabled(session.running)
-                Button(session.running ? "Running…" : "Run") { session.run() }
-                    .keyboardShortcut(.return)
-                    .disabled(session.running)
+        VStack(spacing: 0) {
+            header
+            if !session.collapsed {
+                chat
+                if let pending = session.pending { approvalCard(pending) }
+                inputBar
             }
         }
-        .padding(14)
-        .frame(width: 480, height: 440)
-        .onAppear { commandFocused = true }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(RoundedRectangle(cornerRadius: 16).fill(paper))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.primary.opacity(0.07)))
         .onChange(of: session.focusTick) { _ in commandFocused = true }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Circle().fill(accent).frame(width: 7, height: 7)
+            Text("Vox").font(.system(size: 13, weight: .semibold))
+            Spacer()
+            headerButton(session.collapsed ? "chevron.down" : "chevron.up") {
+                session.collapsed.toggle(); onCollapse()
+            }
+            headerButton("xmark") { onClose() }
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+    }
+
+    private func headerButton(_ symbol: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var chat: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(session.lines) { row($0).id($0.id) }
+                    Color.clear.frame(height: 1).id("bottom")
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+            }
+            .onChange(of: session.lines.count) { _ in
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: session.pending?.tool) { _ in
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+        }
+        .frame(maxHeight: .infinity)
     }
 
     @ViewBuilder
     private func row(_ line: VoxSession.Line) -> some View {
         switch line.kind {
         case .user:
-            Text(line.text).bold()
-        case .status:
-            Text(line.text).font(.caption).foregroundStyle(.secondary)
-        case .tool:
-            Text(line.text).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+            HStack {
+                Spacer(minLength: 56)
+                Text(line.text)
+                    .font(.system(size: 15))
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(userBubble)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .textSelection(.enabled)
+            }
         case .result:
-            Text(line.text).padding(.top, 2)
+            // Assistant: plain flowing text, no bubble (Claude style).
+            Text(line.text)
+                .font(.system(size: 15))
+                .lineSpacing(4)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .status:
+            Text(line.text)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .tool:
+            HStack(spacing: 6) {
+                Image(systemName: line.text.hasPrefix("✓") ? "checkmark" : "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                Text(line.text.dropFirst(2))
+                    .font(.system(size: 12, design: .monospaced))
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private func approvalCard(_ pending: Router.ProposedCall) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Approve action", systemImage: "hand.raised.fill")
+                .font(.system(size: 13, weight: .semibold))
+            Text("\(pending.connector) · \(pending.tool)")
+                .font(.system(size: 12, design: .monospaced))
+            Text(pending.argsJSON)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack {
+                Button("Approve") { session.resolve(true) }
+                    .keyboardShortcut(.defaultAction)
+                    .tint(accent)
+                Button("Cancel") { session.resolve(false) }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(12)
+        .background(accent.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
+    private var inputBar: some View {
+        HStack(spacing: 8) {
+            TextField("Reply to Vox…", text: $session.command, onCommit: { session.run() })
+                .textFieldStyle(.plain)
+                .font(.system(size: 15))
+                .focused($commandFocused)
+                .disabled(session.running)
+            Button { session.run() } label: {
+                Image(systemName: session.running ? "ellipsis.circle" : "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(canSend ? accent : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 14).fill(fieldBg))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.12)))
+        .padding(16)
+    }
+
+    private var canSend: Bool {
+        !session.running && !session.command.trimmingCharacters(in: .whitespaces).isEmpty
     }
 }

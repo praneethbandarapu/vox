@@ -494,17 +494,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicator.hide()
         voxSession.reset(command: transcript)
         if promptWindow == nil {
-            let hosting = NSHostingController(rootView: PromptView(session: voxSession))
-            let w = NSWindow(contentViewController: hosting)
-            w.title = "Vox"
-            w.styleMask = [.titled, .closable]
-            w.isReleasedWhenClosed = false
+            let root = PromptView(
+                session: voxSession,
+                onCollapse: { [weak self] in self?.layoutPrompt() },
+                onClose: { [weak self] in self?.promptWindow?.orderOut(nil) }
+            )
+            let hosting = NSHostingController(rootView: root)
+            hosting.view.wantsLayer = true
+            hosting.view.layer?.backgroundColor = .clear
+            let w = PanelWindow(contentViewController: hosting)
+            w.styleMask = [.borderless]
+            w.isOpaque = false
+            w.backgroundColor = .clear
+            w.hasShadow = true
             w.level = .floating
+            w.isReleasedWhenClosed = false
+            w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             promptWindow = w
         }
+        layoutPrompt()
         NSApp.activate(ignoringOtherApps: true)
-        promptWindow?.center()
         promptWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    // Dock the panel to the right edge; collapsed = a slim bar anchored at the
+    // top-right, expanded = near full height. Animated.
+    @MainActor
+    private func layoutPrompt() {
+        guard let w = promptWindow, let vf = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
+        let width: CGFloat = 400, margin: CGFloat = 16
+        let height: CGFloat = voxSession.collapsed ? 52 : vf.height - margin * 2
+        let x = vf.maxX - width - margin
+        let y = vf.maxY - margin - height   // top-anchored
+        w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true, animate: true)
     }
 
     private func showAlert(_ title: String, _ text: String) {
