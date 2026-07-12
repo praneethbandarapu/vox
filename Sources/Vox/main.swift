@@ -10,6 +10,21 @@ import SwiftUI
 // transcription; optionally cleaned by Claude; then typed into the focused app.
 // Secrets (Deepgram, Anthropic keys) live only in the macOS Keychain.
 
+// A cleaned dictation should keep most of the words that were actually said;
+// cleanup only drops fillers and fixes spelling. If the "cleaned" text shares
+// too few words with the raw transcript, the model answered/echoed/hallucinated
+// instead of cleaning, so we reject it and keep the raw transcript.
+func cleaningIsFaithful(raw: String, cleaned: String) -> Bool {
+    func words(_ s: String) -> [String] {
+        s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+    }
+    let rawWords = words(raw)
+    guard !rawWords.isEmpty else { return true }
+    let cleanedSet = Set(words(cleaned))
+    let matched = rawWords.filter { cleanedSet.contains($0) }.count
+    return Double(matched) / Double(rawWords.count) >= 0.6
+}
+
 let logPath = "/tmp/vox.log"
 let deepgramAccount = "deepgram-api-key"
 let anthropicAccount = "anthropic-api-key"
@@ -42,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rightCommandDown = false
     private enum Mode { case dictation, agent }
     private var mode: Mode = .dictation
+    private let voxSession: VoxSession = MainActor.assumeIsolated { VoxSession() }
+    private var promptWindow: NSWindow?
     private var active = false
     private let capture = AudioCapture()
     private var transcriber: Transcriber?
@@ -407,6 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             let text = (await t.finish()).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { logf("empty transcript"); return }
+            logf("[dictation] raw=\"\(text.prefix(200))\"")
             switch mode {
             case .dictation:
                 var out = text
@@ -414,7 +432,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if cleanupEnabled && cleaner.isConfigured,
                    let cleaned = await cleaner.clean(text)?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !cleaned.isEmpty {
-                    out = cleaned
+                    if cleaningIsFaithful(raw: text, cleaned: cleaned) {
+                        out = cleaned
+                        logf("[dictation] cleaned=\"\(cleaned.prefix(200))\"")
+                    } else {
+                        // Weak model answered/echoed/hallucinated. Trust the raw transcript.
+                        logf("[dictation] cleaning rejected (diverged from raw); using raw")
+                    }
+                } else {
+                    logf("[dictation] cleanup skipped (enabled=\(cleanupEnabled))")
                 }
                 let finalText = out
                 await MainActor.run {
@@ -423,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.playSound(delivered ? "Pop" : "Funk") // Funk = buffered, use Cmd+Shift+V
                 }
             case .agent:
-                await MainActor.run { self.startAgentFlow(text) }
+                await MainActor.run { self.showPrompt(text) }
             }
         }
     }
@@ -436,56 +462,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Gate 1 (editable transcript) -> Router (tool-calling over all connectors)
     // -> per-tool confirm -> execute via the bridge -> result.
-    private func startAgentFlow(_ originalTranscript: String) {
-        guard let command = promptEditableTranscript(originalTranscript), !command.isEmpty else {
-            logf("[agent] cancelled at transcript")
-            indicator.hide()
-            return
+    // Open the interactive command window with the heard transcript prefilled.
+    // The window owns the whole agent interaction: edit, run, approve, result.
+    @MainActor
+    private func showPrompt(_ transcript: String) {
+        indicator.hide()
+        voxSession.reset(command: transcript)
+        if promptWindow == nil {
+            let hosting = NSHostingController(rootView: PromptView(session: voxSession))
+            let w = NSWindow(contentViewController: hosting)
+            w.title = "Vox"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.level = .floating
+            promptWindow = w
         }
-        indicator.show("● Thinking…")
-        Task {
-            let result = await Router.run(
-                command: command,
-                confirm: { [weak self] proposed in await self?.confirmToolCall(proposed) ?? false },
-                onStatus: { [weak self] status in
-                    DispatchQueue.main.async { self?.indicator.show("● \(status)") }
-                }
-            )
-            await MainActor.run {
-                self.indicator.hide()
-                self.playSound("Glass")
-                self.showAlert("Vox", result)
-            }
-        }
-    }
-
-    private func confirmToolCall(_ proposed: Router.ProposedCall) async -> Bool {
-        await MainActor.run {
-            self.indicator.hide()
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            alert.messageText = "Run \(proposed.connector) · \(proposed.tool)?"
-            alert.informativeText = proposed.argsJSON
-            alert.addButton(withTitle: "Approve")
-            alert.addButton(withTitle: "Cancel")
-            return alert.runModal() == .alertFirstButtonReturn
-        }
-    }
-
-    private func promptEditableTranscript(_ transcript: String) -> String? {
         NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Command"
-        alert.informativeText = "Vox heard this. Edit if needed, then Run."
-        alert.addButton(withTitle: "Run")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        field.stringValue = transcript
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        return alert.runModal() == .alertFirstButtonReturn
-            ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            : nil
+        promptWindow?.center()
+        promptWindow?.makeKeyAndOrderFront(nil)
     }
 
     private func showAlert(_ title: String, _ text: String) {

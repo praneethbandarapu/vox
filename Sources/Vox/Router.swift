@@ -39,6 +39,14 @@ enum Router {
                 catalog.append("\(fnName): \(desc.prefix(90))")
             }
         }
+        // Native fast-path tools for the chosen connectors (exact ops the MCP
+        // servers can't do). Distinct name namespace; executed by local code.
+        let chosenIds = Set(chosen.map { $0.id })
+        for nt in NativeTools.all where chosenIds.contains(nt.connectorId) {
+            route[nt.id] = ("native", nt.id)
+            schemas[nt.id] = nt.inputSchema
+            catalog.append("\(nt.id): \(nt.description.prefix(110))")
+        }
         logf("[router] \(catalog.count) tools; sample: \(catalog.prefix(3).joined(separator: " | "))")
         onStatus("Thinking…")
 
@@ -66,10 +74,14 @@ enum Router {
                 if approved {
                     onStatus("Running \(dest.tool)…")
                     let args = (try? JSONSerialization.jsonObject(with: Data(argsJSON.utf8))) as? [String: Any] ?? [:]
-                    result = await ConnectorManager.shared.call(dest.connector, tool: dest.tool, arguments: args) ?? "Tool error."
+                    if dest.connector == "native" {
+                        result = await (NativeTools.tool(dest.tool)?.handler(args) ?? "Unknown native tool.")
+                    } else {
+                        result = await ConnectorManager.shared.call(dest.connector, tool: dest.tool, arguments: args) ?? "Tool error."
+                    }
                 }
                 executed.insert(decision.tool)
-                scratch += "\n[\(decision.tool)] -> \(result.prefix(2000))"
+                scratch += "\n[\(decision.tool)] -> \(result.prefix(8000))"
                 logf("[router] result[\(decision.tool)] approved=\(approved): \(result.prefix(200))")
             default:
                 return "Unexpected router state."
@@ -104,6 +116,7 @@ enum Router {
         - "question": a required detail is missing and no tool can find it; ask ONE short question in text. Never guess names or emails.
         CRITICAL: If "Work so far" already contains a result for a tool, that IS your data, do NOT call that tool again. A successful but EMPTY result (e.g. totalCount 0, empty list) is a valid answer meaning "none" (e.g. no events = "nothing scheduled"). Once you have results, choose "answer".
         The user has a single Google account labelled "normal"; for calendar tools the account is "normal" and the calendar is "primary". NEVER ask which account, email, or calendar to use, just proceed with those.
+        For "how many emails" / email count questions, use gmail_count (do NOT list emails to count them).
         """
         let user = """
         Command: \(command)
@@ -142,7 +155,7 @@ enum Router {
             "model": model,
             "temperature": 0,
             "messages": [
-                ["role": "system", "content": "Produce the correct arguments to call the tool for the user's command. Use only real values; never invent emails or names. For Google Calendar tools: the account is \"normal\" (set any account/account-name field to \"normal\") and calendarId is \"primary\". Use the context if relevant."],
+                ["role": "system", "content": "Produce the correct arguments to call the tool for the user's command. Use only real values; never invent emails or names. For Google Calendar tools: the account is \"normal\" (set any account/account-name field to \"normal\") and calendarId is \"primary\". If the user asks how many, or for all/many items, set any maxResults/limit/count parameter to 100. Use the context if relevant."],
                 ["role": "user", "content": "Command: \(command)\n\nContext:\n\(scratch.isEmpty ? "(none)" : scratch)"]
             ],
             "tools": tools,
