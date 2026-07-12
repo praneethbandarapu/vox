@@ -10,19 +10,29 @@ import SwiftUI
 // transcription; optionally cleaned by Claude; then typed into the focused app.
 // Secrets (Deepgram, Anthropic keys) live only in the macOS Keychain.
 
-// A cleaned dictation should keep most of the words that were actually said;
-// cleanup only drops fillers and fixes spelling. If the "cleaned" text shares
-// too few words with the raw transcript, the model answered/echoed/hallucinated
-// instead of cleaning, so we reject it and keep the raw transcript.
+// A cleaned dictation should keep most of the words that were actually said and
+// not invent new ones; cleanup only drops fillers, fixes spelling, and adds a
+// few small connecting words. We reject a "cleaning" that fails either side:
+//  - recall: too few of the spoken words survive (model answered/echoed), or
+//  - precision: too many foreign content words were added (model prepended an
+//    answer/preamble). Digits (list numbers) and small function words are
+//    excused so numbered lists and article-fixes still pass.
+// On reject we keep the raw transcript, so a weak model can't type words the
+// user never said.
 func cleaningIsFaithful(raw: String, cleaned: String) -> Bool {
+    let stop: Set<String> = ["a","an","the","to","of","in","on","for","and","or","is","are","was","were","at","by","with","as","it","that","this","include","includes"]
     func words(_ s: String) -> [String] {
         s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
     }
     let rawWords = words(raw)
     guard !rawWords.isEmpty else { return true }
-    let cleanedSet = Set(words(cleaned))
-    let matched = rawWords.filter { cleanedSet.contains($0) }.count
-    return Double(matched) / Double(rawWords.count) >= 0.6
+    let rawSet = Set(rawWords)
+    let cleanedWords = words(cleaned)
+    let matched = rawWords.filter { Set(cleanedWords).contains($0) }.count
+    let recall = Double(matched) / Double(rawWords.count)
+    let added = Set(cleanedWords).filter { !rawSet.contains($0) && Int($0) == nil && !stop.contains($0) }.count
+    let addBudget = max(2, rawWords.count / 4)
+    return recall >= 0.6 && added <= addBudget
 }
 
 let logPath = "/tmp/vox.log"
@@ -61,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var promptWindow: NSWindow?
     private var active = false
     private let capture = AudioCapture()
+    private var soundCache: [String: NSSound] = [:]
     private var transcriber: Transcriber?
     private let indicator = RecordingIndicator()
     private let agent = ClaudeAgent()
@@ -81,6 +92,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestMicrophone()
         startKeyMonitor()
         registerPasteHotKey()
+        // Preload cue sounds so the first keypress doesn't pay NSSound's load.
+        for name in ["Tink", "Pop", "Funk", "Glass"] { soundCache[name] = NSSound(named: name) }
         logf("launch complete. deepgramKeySet=\(Keychain.exists(account: deepgramAccount))")
     }
 
@@ -330,7 +343,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func playSound(_ name: String) {
-        NSSound(named: name)?.play()
+        let sound = soundCache[name] ?? NSSound(named: name)
+        soundCache[name] = sound
+        // Off the main thread: playback must never delay the icon paint.
+        DispatchQueue.global(qos: .userInitiated).async { sound?.stop(); sound?.play() }
     }
 
     private func promptForKey(label: String, account: String) {
@@ -382,30 +398,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let optDown = (flags & kRightOptionBit) != 0
         if optDown != rightOptionDown {
             rightOptionDown = optDown
-            optDown ? startListening(.dictation) : stopListening()
+            optDown ? startListening(.dictation, eventTime: event.timestamp) : stopListening()
         }
         let cmdDown = (flags & kRightCommandBit) != 0
         if cmdDown != rightCommandDown {
             rightCommandDown = cmdDown
-            cmdDown ? startListening(.agent) : stopListening()
+            cmdDown ? startListening(.agent, eventTime: event.timestamp) : stopListening()
         }
     }
 
-    private func startListening(_ mode: Mode) {
+    private func startListening(_ mode: Mode, eventTime: TimeInterval? = nil) {
         guard transcriber == nil else { return } // already listening
-        let t = ProviderFactory.makeTranscriber()
-        guard t.isConfigured else {
-            logf("STT provider not configured")
-            NSSound.beep()
-            return
-        }
+        let t0 = ProcessInfo.processInfo.systemUptime
+        func ms() -> Int { Int((ProcessInfo.processInfo.systemUptime - t0) * 1000) }
+        // Instant feedback first: show the icon and play the cue before any
+        // transcriber/network setup, so the UI never trails the keypress.
         self.mode = mode
         active = true
-        renderIcon()
-        indicator.show()
-        playSound("Tink")
-        logf("listening (mode=\(mode))")
-        t.start()
+        renderIcon(); logf("t.renderIcon=\(ms())ms")
+        indicator.show(); logf("t.indicatorShow=\(ms())ms")
+        playSound("Tink"); logf("t.playSound=\(ms())ms")
+        if let et = eventTime {
+            logf("key->icon \(Int((t0 - et) * 1000))ms (event delivery)")
+        }
+        let t = ProviderFactory.makeTranscriber(); logf("t.makeTranscriber=\(ms())ms")
+        let configured = t.isConfigured; logf("t.isConfigured=\(ms())ms cfg=\(configured)")
+        guard configured else {
+            logf("STT provider not configured")
+            NSSound.beep()
+            indicator.hide(); active = false; renderIcon()
+            return
+        }
+        logf("listening (mode=\(mode)) setup \(ms())ms")
+        t.start(); logf("t.start=\(ms())ms")
         transcriber = t
         capture.onChunk = { [weak t] data in t?.send(data) }
         capture.start()
@@ -437,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         logf("[dictation] cleaned=\"\(cleaned.prefix(200))\"")
                     } else {
                         // Weak model answered/echoed/hallucinated. Trust the raw transcript.
-                        logf("[dictation] cleaning rejected (diverged from raw); using raw")
+                        logf("[dictation] cleaning REJECTED, using raw. rejected=\"\(cleaned.prefix(200))\"")
                     }
                 } else {
                     logf("[dictation] cleanup skipped (enabled=\(cleanupEnabled))")
